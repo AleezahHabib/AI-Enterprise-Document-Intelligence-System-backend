@@ -1,0 +1,498 @@
+openapi: 3.1.0
+info:
+  title: Verity — Document Intelligence API
+  version: 1.0.0
+  description: >
+    Grounded retrieval-augmented question answering over an enterprise document
+    corpus. Every factual claim carries a verified citation; when evidence is
+    insufficient the API refuses rather than guessing.
+servers:
+  - url: https://{host}/api/v1
+    variables:
+      host:
+        default: localhost:8000
+
+security:
+  - SessionId: []
+  - BearerAuth: []
+  - {}
+
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      summary: Liveness probe and cold-start wake ping
+      security: []
+      responses:
+        '200':
+          description: Process is alive
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+
+  /health/ready:
+    get:
+      operationId: getReadiness
+      summary: Readiness — verifies database connectivity and schema version
+      security: []
+      responses:
+        '200':
+          description: Ready
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /documents:
+    post:
+      operationId: uploadDocument
+      summary: Upload a PDF or DOCX for ingestion
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                title:
+                  type: string
+                  maxLength: 300
+                  description: Optional override; defaults to the filename
+      responses:
+        '202':
+          description: Accepted; ingestion queued
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Document' }
+        '200':
+          description: >
+            Identical file already uploaded by this owner. Returns the existing
+            document unchanged; no new ingestion is started.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Document' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+    get:
+      operationId: listDocuments
+      summary: List documents visible to the caller
+      parameters:
+        - name: scope
+          in: query
+          schema: { $ref: '#/components/schemas/Scope' }
+          description: Which documents to list. Defaults to `all`.
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        '200':
+          description: Document list
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DocumentList' }
+
+  /documents/{document_id}:
+    parameters:
+      - name: document_id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      operationId: getDocument
+      summary: Document detail, including ingestion status
+      responses:
+        '200':
+          description: Document
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Document' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      operationId: deleteDocument
+      summary: Delete a document and all of its chunks
+      responses:
+        '204': { description: Deleted }
+        '403':
+          description: Demo documents cannot be deleted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /documents/{document_id}/file:
+    parameters:
+      - name: document_id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      operationId: getDocumentFile
+      summary: Original uploaded file, for the citation source viewer
+      responses:
+        '200':
+          description: File stream
+          content:
+            application/pdf:
+              schema: { type: string, format: binary }
+            application/vnd.openxmlformats-officedocument.wordprocessingml.document:
+              schema: { type: string, format: binary }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /query:
+    post:
+      operationId: postQuery
+      summary: Ask a grounded question over the corpus
+      description: >
+        Always returns 200 on a successful evaluation. A refusal
+        (`status: insufficient_context`) is a correct outcome, not an error.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QueryRequest' }
+      responses:
+        '200':
+          description: Answer or refusal
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QueryResponse' }
+        '409':
+          description: Requested documents exist but are not yet `ready`
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /queries/{query_id}:
+    parameters:
+      - name: query_id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      operationId: getQuery
+      summary: Replay a previously logged query, including retrieval detail
+      responses:
+        '200':
+          description: Logged query
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QueryResponse' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+components:
+  securitySchemes:
+    SessionId:
+      type: apiKey
+      in: header
+      name: X-Session-Id
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  responses:
+    Unauthorized:
+      description: Bearer token invalid or expired
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Not found, or not visible to this identity
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    PayloadTooLarge:
+      description: Upload exceeds the configured maximum
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    UnsupportedMediaType:
+      description: Only PDF and DOCX are accepted
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ValidationError:
+      description: Request failed schema validation
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    RateLimited:
+      description: Too many requests
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: Seconds to wait before retrying
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ServiceUnavailable:
+      description: A required dependency is unavailable
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Stable machine-readable code. Enumerated in BE-13.
+              example: DOCUMENT_TOO_LARGE
+            message:
+              type: string
+              description: Human-readable, safe to display to end users.
+            details:
+              type: object
+              additionalProperties: true
+            request_id:
+              type: string
+
+    Health:
+      type: object
+      required: [status, version]
+      properties:
+        status: { type: string, enum: [ok] }
+        version: { type: string, example: "1.0.0" }
+
+    Readiness:
+      type: object
+      required: [status, schema_version, database]
+      properties:
+        status: { type: string, enum: [ready, degraded] }
+        schema_version: { type: integer }
+        database: { type: string, enum: [ok, unavailable] }
+
+    Scope:
+      type: string
+      enum: [demo, mine, all]
+      default: all
+      description: >
+        `demo` — the curated public corpus only.
+        `mine` — documents owned by this session or user only.
+        `all`  — both.
+
+    DocumentStatus:
+      type: string
+      enum: [pending, extracting, chunking, embedding, ready, failed]
+
+    Document:
+      type: object
+      required: [id, title, filename, mime, byte_size, status, is_demo, created_at]
+      properties:
+        id:           { type: string, format: uuid }
+        title:        { type: string }
+        filename:     { type: string }
+        mime:         { type: string }
+        byte_size:    { type: integer }
+        status:       { $ref: '#/components/schemas/DocumentStatus' }
+        status_detail:
+          type: [string, "null"]
+          description: Present when status is `failed`; safe to display.
+        error_code:
+          type: [string, "null"]
+        page_count:   { type: [integer, "null"] }
+        chunk_count:  { type: [integer, "null"] }
+        is_demo:
+          type: boolean
+          description: Demo documents are read-only for every caller.
+        progress:
+          type: [number, "null"]
+          minimum: 0
+          maximum: 1
+          description: Best-effort ingestion progress. See BE-05 for stage weights.
+        created_at:   { type: string, format: date-time }
+        ready_at:     { type: [string, "null"], format: date-time }
+
+    DocumentList:
+      type: object
+      required: [items, total]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Document' }
+        total: { type: integer }
+
+    QueryRequest:
+      type: object
+      required: [question]
+      properties:
+        question:
+          type: string
+          minLength: 3
+          maxLength: 1000
+        scope:
+          $ref: '#/components/schemas/Scope'
+        document_ids:
+          type: array
+          maxItems: 50
+          items: { type: string, format: uuid }
+          description: >
+            Restrict retrieval to these documents. Combined with `scope` as an
+            intersection. Omit to search the whole scope.
+        include_retrieval:
+          type: boolean
+          default: true
+          description: >
+            When true the response carries the `retrieval` block that powers the
+            retrieval inspector (FE-12).
+
+    Citation:
+      type: object
+      required: [chunk_id, quote, document_id, document_title]
+      properties:
+        chunk_id:
+          type: integer
+          description: MUST belong to the retrieved set for this query (SYS-R17).
+        quote:
+          type: string
+          description: >
+            Verbatim text from the cited chunk. Verified by normalized string
+            match before this response is returned (SYS-R18).
+        document_id:    { type: string, format: uuid }
+        document_title: { type: string }
+        page:           { type: [integer, "null"] }
+        section_path:   { type: [string, "null"] }
+        char_start:     { type: [integer, "null"] }
+        char_end:       { type: [integer, "null"] }
+
+    Claim:
+      type: object
+      required: [text, citations]
+      properties:
+        text:
+          type: string
+          description: One atomic factual assertion.
+        citations:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/Citation' }
+
+    RetrievedChunk:
+      type: object
+      required: [chunk_id, document_id, document_title, similarity, rrf_score, used_in_context]
+      properties:
+        chunk_id:       { type: integer }
+        document_id:    { type: string, format: uuid }
+        document_title: { type: string }
+        page:           { type: [integer, "null"] }
+        section_path:   { type: [string, "null"] }
+        preview:
+          type: string
+          description: First 300 characters of the chunk, for the inspector.
+        similarity:
+          type: number
+          description: Cosine similarity in [-1, 1]. NOT distance. See BE-08-R7.
+        vector_rank:
+          type: [integer, "null"]
+          description: Rank in the vector leg; null if that leg did not return it.
+        keyword_rank:
+          type: [integer, "null"]
+        rrf_score:      { type: number }
+        used_in_context:
+          type: boolean
+          description: Whether this chunk was passed to the generation model.
+
+    GateResult:
+      type: object
+      required: [passed, top_similarity, supporting_count, thresholds]
+      properties:
+        passed: { type: boolean }
+        reason:
+          type: [string, "null"]
+          enum: [null, no_candidates, below_top_similarity, insufficient_supporting_chunks, model_declined, validation_failed]
+        top_similarity:   { type: [number, "null"] }
+        supporting_count: { type: integer }
+        thresholds:
+          type: object
+          properties:
+            min_top_similarity:        { type: number }
+            min_supporting_similarity: { type: number }
+            min_supporting_chunks:     { type: integer }
+
+    RetrievalBlock:
+      type: object
+      required: [chunks, gate, candidate_count]
+      properties:
+        chunks:
+          type: array
+          items: { $ref: '#/components/schemas/RetrievedChunk' }
+        gate: { $ref: '#/components/schemas/GateResult' }
+        candidate_count:
+          type: integer
+          description: Total candidates considered before fusion.
+
+    QueryResponse:
+      type: object
+      required: [query_id, status, question, created_at]
+      properties:
+        query_id: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [answered, insufficient_context]
+        question: { type: string }
+        answer:
+          type: [string, "null"]
+          description: >
+            Prose answer assembled from `claims`, for display. Null when
+            status is `insufficient_context`.
+        claims:
+          type: array
+          items: { $ref: '#/components/schemas/Claim' }
+          description: Empty when status is `insufficient_context`.
+        refusal:
+          type: [object, "null"]
+          properties:
+            message:
+              type: string
+              description: Fixed deterministic copy. Never model-generated (SYS-R21).
+            reason:
+              type: string
+              enum: [no_candidates, below_top_similarity, insufficient_supporting_chunks, model_declined, validation_failed]
+            nearest_documents:
+              type: array
+              items:
+                type: object
+                properties:
+                  document_id:    { type: string, format: uuid }
+                  document_title: { type: string }
+                  similarity:     { type: number }
+        retrieval:
+          oneOf:
+            - $ref: '#/components/schemas/RetrievalBlock'
+            - type: "null"
+        timings_ms:
+          type: object
+          properties:
+            embed:     { type: integer }
+            retrieve:  { type: integer }
+            generate:  { type: integer }
+            validate:  { type: integer }
+            total:     { type: integer }
+        models:
+          type: object
+          properties:
+            embedding:  { type: string }
+            generation: { type: [string, "null"] }
+        created_at: { type: string, format: date-time }
